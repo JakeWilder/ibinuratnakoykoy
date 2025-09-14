@@ -1,0 +1,15 @@
+# deps & build
+node_modules/
+.pnpm/
+**/.pnpm/
+.next/
+out/
+
+# env
+.env
+.env.*
+!.env.example
+
+# logs & misc
+*.log
+.DS_Store
