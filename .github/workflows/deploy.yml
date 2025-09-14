@@ -1,0 +1,144 @@
+name: CI/CD - Build and Deploy to VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+env:
+  NODE_VERSION: "20"
+  APP_DIR: ${{ secrets.APP_DIR }}
+  PM2_APP_NAME: "myapp"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable Corepack + pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@latest --activate
+          pnpm -v
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Next.js
+        run: pnpm build
+
+      - name: Upload deploy bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-build
+          path: |
+            .next
+            public
+            package.json
+            pnpm-lock.yaml
+            next.config.*
+            ecosystem.config.js
+            src
+            tsconfig.json
+            postcss.config.js
+            tailwind.config.js
+            middleware.ts
+            drizzle.config.ts
+            drizzle
+            scripts
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: next-build
+          path: app
+
+      - name: Add SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Rsync to VPS (keep .env on server)
+        run: |
+          rsync -az --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.env' \
+            app/ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.APP_DIR }}/
+
+      - name: Install deps on VPS + migrate + ensure build + restart PM2
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash -se <<'EOF'
+          set -euxo pipefail
+          cd '${{ secrets.APP_DIR }}'
+          corepack enable || true
+          corepack prepare pnpm@latest --activate || true
+
+          # install WITH devDeps so 'tsx' exists
+          pnpm install --frozen-lockfile --prod=false
+
+          # tiny debug so alam natin kung nandito ang scripts at folders
+          node -e "console.log('scripts:', require('./package.json').scripts)"
+          ls -la drizzle scripts || true
+
+          # run migrations (Drizzle)
+          pnpm run migrate
+
+          # ensure build exists
+          if [ ! -d .next ] || [ ! -f .next/BUILD_ID ]; then
+            pnpm build
+          fi
+
+          pm2 stop myapp || true
+          pm2 start ecosystem.config.js
+          pm2 save
+
+          for i in {1..30}; do ss -ltnp | grep -q ':3000' && break || sleep 1; done
+          ss -ltnp | grep ':3000' || { pm2 logs myapp --lines 200 || true; exit 1; }
+          EOF
+
+      - name: Health check (over SSH, retries + logs)
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} bash -se <<'EOF'
+          set -e
+          code=""
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/ping || true)
+            echo "ping attempt $i -> $code"
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          if [ "$code" != "200" ]; then
+            echo "Ping still failing; dumping PM2 status/logs…"
+            pm2 ls || true
+            pm2 logs myapp --lines 200 || true
+            ss -ltnp || true
+            exit 1
+          fi
+          code2=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/dbcheck || true)
+          echo "dbcheck -> $code2"
+          [ "$code2" = "200" ] || { pm2 logs myapp --lines 200 || true; exit 1; }
+          EOF
